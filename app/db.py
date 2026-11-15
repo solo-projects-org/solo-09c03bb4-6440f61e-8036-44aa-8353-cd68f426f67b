@@ -54,6 +54,33 @@ CREATE TABLE IF NOT EXISTS requests (
     budget_after  TEXT NOT NULL,
     created_at    TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS reconciliations (
+    reconciliation_id TEXT PRIMARY KEY,
+    file_fingerprint  TEXT NOT NULL,
+    source_filename   TEXT NOT NULL,
+    row_count         INTEGER NOT NULL,
+    added_count       INTEGER NOT NULL,
+    missing_count     INTEGER NOT NULL,
+    changed_count     INTEGER NOT NULL,
+    created_at        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reconciliation_entries (
+    id                INTEGER PRIMARY KEY,
+    reconciliation_id TEXT NOT NULL,
+    subject_id        TEXT NOT NULL,
+    change_type       TEXT NOT NULL CHECK (change_type IN ('added', 'missing', 'changed')),
+    before_region     TEXT,
+    after_region      TEXT,
+    before_outcome    INTEGER,
+    after_outcome     INTEGER,
+    FOREIGN KEY (reconciliation_id)
+        REFERENCES reconciliations (reconciliation_id)
+);
+
+CREATE INDEX IF NOT EXISTS reconciliation_entries_report
+    ON reconciliation_entries (reconciliation_id, id);
 """
 
 

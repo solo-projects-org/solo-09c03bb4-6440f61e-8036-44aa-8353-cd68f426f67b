@@ -15,6 +15,10 @@ services:
       TOTAL_BUDGET: "${TOTAL_BUDGET:-1}"
       IMPORT_ON_STARTUP: "1"
       SQLITE_BUSY_TIMEOUT_MS: "30000"
+      # Bearer token for the admin-only /v1/reconciliations endpoints.  Leave
+      # unset to switch the reconciliation API off (it then answers 503).
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
+      MAX_UPLOAD_MB: "${MAX_UPLOAD_MB:-10}"
     volumes:
       # Named volume: the data set, the spent budget and every released answer
       # persist across restarts and `docker compose up` recreations.

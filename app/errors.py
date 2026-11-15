@@ -29,3 +29,30 @@ class RequestIdConflict(Exception):
         super().__init__(
             f"request id {request_id!r} was already used with different parameters"
         )
+
+
+class ReconciliationConflict(Exception):
+    """A reconciliation id was reused with a different uploaded file."""
+
+    def __init__(self, reconciliation_id: str) -> None:
+        self.reconciliation_id = reconciliation_id
+        super().__init__(
+            f"reconciliation id {reconciliation_id!r} is already bound to a "
+            "different file fingerprint"
+        )
+
+
+class ReconciliationCsvError(Exception):
+    """The uploaded reconciliation CSV is structurally invalid."""
+
+
+class UploadTooLarge(ReconciliationCsvError):
+    """The uploaded file exceeds the configured size limit."""
+
+
+class AdminUnauthorized(Exception):
+    """The caller did not prove possession of the configured admin token."""
+
+
+class AdminApiDisabled(Exception):
+    """No admin token is configured, so the reconciliation API is switched off."""

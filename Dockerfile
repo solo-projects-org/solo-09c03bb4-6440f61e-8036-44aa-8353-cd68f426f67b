@@ -25,7 +25,10 @@ USER svc
 ENV DATABASE_PATH=/srv/data/followup.db \
     CSV_PATH=/srv/seed/followup.csv \
     TOTAL_BUDGET=1 \
-    IMPORT_ON_STARTUP=1
+    IMPORT_ON_STARTUP=1 \
+    MAX_UPLOAD_MB=10
+# ADMIN_TOKEN is deliberately not baked into the image; supply it at runtime
+# so the admin-only reconciliation API is enabled per deployment.
 
 EXPOSE 8000
 

@@ -2,34 +2,55 @@
 
 Endpoints
 ---------
-``GET  /health``                 liveness plus whether a data set is loaded
-``GET  /v1/budget``              remaining global privacy budget
-``POST /v1/counts``              privatized count for one (region, outcome)
-``GET  /v1/requests/{id}``       look up a previously released answer
+``GET  /health``                       liveness plus whether a data set is loaded
+``GET  /v1/budget``                    remaining global privacy budget
+``POST /v1/counts``                    privatized count for one (region, outcome)
+``GET  /v1/requests/{id}``             look up a previously released answer
+``POST /v1/reconciliations``           admin: upload a revised CSV, publish a diff report
+``GET  /v1/reconciliations``           admin: list reconciliation report metadata
+``GET  /v1/reconciliations/{id}``      admin: fetch one full per-subject report
 
-Only noisy counts and budget figures ever leave the process; exact counts are
-never part of any response model.
+Only noisy counts and budget figures ever leave the privacy endpoints; the
+reconciliation endpoints are the sole place exact per-subject data is served,
+and only after bearer-token authentication against ``ADMIN_TOKEN``.
 """
 
 from __future__ import annotations
 
+import hmac
 import logging
 import re
 from contextlib import asynccontextmanager
 from decimal import Decimal
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field, field_validator
 
 from . import __version__
 from .config import Settings
 from .db import Database
-from .errors import BudgetExhausted, DatasetMissing, RequestIdConflict
+from .errors import (
+    AdminApiDisabled,
+    AdminUnauthorized,
+    BudgetExhausted,
+    DatasetMissing,
+    ReconciliationConflict,
+    ReconciliationCsvError,
+    RequestIdConflict,
+    UploadTooLarge,
+)
 from .importer import ImportError_, import_csv
 from .models import SqliteRepository
 from .privacy import MIN_EPSILON, canonical_decimal, canonical_epsilon
+from .reconciliation import (
+    ReconciliationEntry,
+    ReconciliationResult,
+    ReconciliationService,
+    ReconciliationSummaryRow,
+)
 from .service import QueryService
 
 logger = logging.getLogger("followup_counts")
@@ -37,6 +58,10 @@ logger = logging.getLogger("followup_counts")
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 REGION_MAX_LEN = 128
 MAX_EPSILON = Decimal("1")
+MAX_FILENAME_LEN = 255
+
+#: OpenAPI security scheme for the admin-only reconciliation endpoints.
+admin_bearer = HTTPBearer(auto_error=False)
 
 
 # --------------------------------------------------------------------------
@@ -153,6 +178,68 @@ class ErrorBody(BaseModel):
 
 
 # --------------------------------------------------------------------------
+# reconciliation models (admin only; exact per-subject data)
+# --------------------------------------------------------------------------
+class ChangedFieldBody(BaseModel):
+    field: str
+    before: str | int | None
+    after: str | int | None
+
+
+class ReconciliationEntryBody(BaseModel):
+    subject_id: str
+    change_type: str = Field(
+        description="added: present only in the uploaded file; "
+        "missing: present only in the base table; "
+        "changed: present in both but region or outcome differs."
+    )
+    before_region: str | None = None
+    after_region: str | None = None
+    before_outcome: int | None = None
+    after_outcome: int | None = None
+    changed_fields: list[ChangedFieldBody] = Field(default_factory=list)
+
+
+class ReconciliationSummaryBody(BaseModel):
+    added: int
+    missing: int
+    changed: int
+
+
+class ReconciliationResponse(BaseModel):
+    reconciliation_id: str
+    file_fingerprint: str = Field(
+        description="SHA-256 of the raw uploaded CSV bytes."
+    )
+    source_filename: str
+    row_count: int
+    created_at: str
+    summary: ReconciliationSummaryBody
+    added: list[ReconciliationEntryBody]
+    missing: list[ReconciliationEntryBody]
+    changed: list[ReconciliationEntryBody]
+    replayed: bool = Field(
+        description="True when a stored report was returned for a retry "
+        "with the same id and identical file."
+    )
+
+
+class ReconciliationSummaryItem(BaseModel):
+    reconciliation_id: str
+    file_fingerprint: str
+    source_filename: str
+    row_count: int
+    added_count: int
+    missing_count: int
+    changed_count: int
+    created_at: str
+
+
+class ReconciliationListResponse(BaseModel):
+    reconciliations: list[ReconciliationSummaryItem]
+
+
+# --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
 def _error(status: int, code: str, message: str, **extra) -> JSONResponse:
@@ -168,6 +255,78 @@ def _dataset_info(database: Database) -> tuple[bool, int | None]:
     return (row is not None, int(row["row_count"]) if row else None)
 
 
+def require_admin(
+    settings: Settings,
+    credentials: HTTPAuthorizationCredentials | None,
+) -> None:
+    """Authenticate an admin call against the env-configured bearer token."""
+    if settings.admin_token is None:
+        # Fail closed but distinct from a bad credential: operators can see
+        # the endpoint in Swagger while the feature is switched off.
+        raise AdminApiDisabled("ADMIN_TOKEN is not configured")
+    if credentials is None or not credentials.scheme.lower() == "bearer":
+        raise AdminUnauthorized("missing bearer token")
+    if not hmac.compare_digest(credentials.credentials, settings.admin_token):
+        raise AdminUnauthorized("invalid admin token")
+
+
+def _entry_body(entry: ReconciliationEntry) -> ReconciliationEntryBody:
+    return ReconciliationEntryBody(
+        subject_id=entry.subject_id,
+        change_type=entry.change_type,
+        before_region=entry.before_region,
+        after_region=entry.after_region,
+        before_outcome=entry.before_outcome,
+        after_outcome=entry.after_outcome,
+        changed_fields=[
+            ChangedFieldBody(
+                field=changed.field, before=changed.before, after=changed.after
+            )
+            for changed in entry.changed_fields
+        ],
+    )
+
+
+def _reconciliation_body(result: ReconciliationResult) -> ReconciliationResponse:
+    return ReconciliationResponse(
+        reconciliation_id=result.reconciliation_id,
+        file_fingerprint=result.file_fingerprint,
+        source_filename=result.source_filename,
+        row_count=result.row_count,
+        created_at=result.created_at,
+        summary=ReconciliationSummaryBody(
+            added=result.summary.added,
+            missing=result.summary.missing,
+            changed=result.summary.changed,
+        ),
+        added=[_entry_body(entry) for entry in result.added],
+        missing=[_entry_body(entry) for entry in result.missing],
+        changed=[_entry_body(entry) for entry in result.changed],
+        replayed=result.replayed,
+    )
+
+
+async def _read_upload(upload: UploadFile, max_bytes: int) -> bytes:
+    """Read an upload with a hard size cap, leaving no oversized temp files."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            await upload.close()
+            raise UploadTooLarge(
+                f"upload exceeds maximum size of {max_bytes} bytes"
+            )
+        chunks.append(chunk)
+    raw = b"".join(chunks)
+    if not raw:
+        raise ReconciliationCsvError("uploaded file is empty")
+    return raw
+
+
 # --------------------------------------------------------------------------
 # application factory
 # --------------------------------------------------------------------------
@@ -176,6 +335,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     database = Database(settings.database_path, settings.sqlite_busy_timeout_ms)
     repository = SqliteRepository(database)
     service = QueryService(repository, settings.total_budget)
+    reconciliation_service = ReconciliationService(database)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -209,7 +369,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "global budget of 1.0. Retrying the same `request_id` with "
             "identical parameters returns the original answer for free; "
             "reusing the id with different parameters is rejected with 409. "
-            "Invalid requests and failed saves never spend budget."
+            "Invalid requests and failed saves never spend budget.\n\n"
+            "The /v1/reconciliations endpoints are administrative: callers "
+            "present the ADMIN_TOKEN bearer token and receive exact "
+            "per-subject diffs between an uploaded revised CSV and the base "
+            "table. Reconciliations never modify the base table or the "
+            "privacy budget."
         ),
         lifespan=lifespan,
     )
@@ -217,6 +382,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.database = database
     app.state.service = service
     app.state.repository = repository
+    app.state.reconciliation_service = reconciliation_service
 
     # -- endpoints ---------------------------------------------------------
     @app.get(
@@ -320,6 +486,145 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             replayed=True,
             charged=False,
         )
+
+    # -- reconciliation (admin only) --------------------------------------
+    @app.post(
+        "/v1/reconciliations",
+        response_model=ReconciliationResponse,
+        summary="Upload a revised CSV and publish its per-subject diff report",
+        tags=["reconciliation"],
+        dependencies=[Depends(admin_bearer)],
+        responses={
+            200: {"description": "Report published, or replayed for an idempotent retry"},
+            401: {"model": ErrorBody, "description": "Missing or invalid admin token"},
+            409: {"model": ErrorBody, "description": "Reconciliation id bound to a different file"},
+            413: {"model": ErrorBody, "description": "Upload exceeds the size limit"},
+            422: {"model": ErrorBody, "description": "Invalid id, malformed CSV, bad row or duplicate subject id"},
+            503: {"model": ErrorBody, "description": "Admin API disabled or no base data set imported"},
+        },
+    )
+    async def create_reconciliation(
+        reconciliation_id: str = Form(
+            ...,
+            min_length=1,
+            max_length=128,
+            description="Client-chosen idempotency key for this reconciliation.",
+        ),
+        file: UploadFile = File(
+            ..., description="Revised follow-up CSV with subject_id, region, outcome."
+        ),
+        credentials: HTTPAuthorizationCredentials | None = Depends(admin_bearer),
+    ):
+        try:
+            require_admin(settings, credentials)
+        except AdminUnauthorized as exc:
+            return _error(401, "unauthorized", str(exc))
+        except AdminApiDisabled as exc:
+            return _error(503, "reconciliation_disabled", str(exc))
+
+        if not REQUEST_ID_PATTERN.fullmatch(reconciliation_id):
+            return _error(
+                422,
+                "invalid_request",
+                "reconciliation_id must start with a letter or digit and "
+                "contain only letters, digits, '.', '_', ':' or '-'",
+            )
+
+        filename = (file.filename or "").strip() or "upload.csv"
+        if len(filename) > MAX_FILENAME_LEN:
+            filename = filename[:MAX_FILENAME_LEN]
+
+        try:
+            raw = await _read_upload(file, settings.max_upload_bytes)
+        except UploadTooLarge as exc:
+            return _error(413, "file_too_large", str(exc))
+        except ReconciliationCsvError as exc:
+            return _error(422, "invalid_csv", str(exc))
+
+        try:
+            result = reconciliation_service.submit(
+                reconciliation_id=reconciliation_id,
+                raw=raw,
+                source_filename=filename,
+            )
+        except ReconciliationConflict as exc:
+            return _error(409, "reconciliation_conflict", str(exc))
+        except ReconciliationCsvError as exc:
+            return _error(422, "invalid_csv", str(exc))
+        except DatasetMissing as exc:
+            return _error(503, "dataset_missing", str(exc))
+
+        return _reconciliation_body(result)
+
+    @app.get(
+        "/v1/reconciliations",
+        response_model=ReconciliationListResponse,
+        summary="List reconciliation reports (metadata only)",
+        tags=["reconciliation"],
+        dependencies=[Depends(admin_bearer)],
+        responses={
+            401: {"model": ErrorBody, "description": "Missing or invalid admin token"},
+            503: {"model": ErrorBody, "description": "Admin API disabled"},
+        },
+    )
+    def list_reconciliations(
+        credentials: HTTPAuthorizationCredentials | None = Depends(admin_bearer),
+    ):
+        try:
+            require_admin(settings, credentials)
+        except AdminUnauthorized as exc:
+            return _error(401, "unauthorized", str(exc))
+        except AdminApiDisabled as exc:
+            return _error(503, "reconciliation_disabled", str(exc))
+
+        rows: list[ReconciliationSummaryRow] = reconciliation_service.list_summaries()
+        return ReconciliationListResponse(
+            reconciliations=[
+                ReconciliationSummaryItem(
+                    reconciliation_id=row.reconciliation_id,
+                    file_fingerprint=row.file_fingerprint,
+                    source_filename=row.source_filename,
+                    row_count=row.row_count,
+                    added_count=row.added_count,
+                    missing_count=row.missing_count,
+                    changed_count=row.changed_count,
+                    created_at=row.created_at,
+                )
+                for row in rows
+            ]
+        )
+
+    @app.get(
+        "/v1/reconciliations/{reconciliation_id}",
+        response_model=ReconciliationResponse,
+        summary="Fetch one full per-subject reconciliation report",
+        tags=["reconciliation"],
+        dependencies=[Depends(admin_bearer)],
+        responses={
+            401: {"model": ErrorBody, "description": "Missing or invalid admin token"},
+            404: {"model": ErrorBody, "description": "Unknown reconciliation id"},
+            503: {"model": ErrorBody, "description": "Admin API disabled"},
+        },
+    )
+    def get_reconciliation(
+        reconciliation_id: str,
+        credentials: HTTPAuthorizationCredentials | None = Depends(admin_bearer),
+    ):
+        try:
+            require_admin(settings, credentials)
+        except AdminUnauthorized as exc:
+            return _error(401, "unauthorized", str(exc))
+        except AdminApiDisabled as exc:
+            return _error(503, "reconciliation_disabled", str(exc))
+
+        result = reconciliation_service.get(reconciliation_id)
+        if result is None:
+            return _error(
+                404,
+                "reconciliation_not_found",
+                "no report exists for this reconciliation id",
+            )
+        return _reconciliation_body(result)
 
     # -- uniform error shape ----------------------------------------------
     @app.exception_handler(RequestValidationError)
