@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1
+# Runtime/development ignores.  The seed CSV is *not* ignored because the
+# image imports it on first start.
+.git
+.venv
+.venv/
+.pytest_cache
+__pycache__/
+*.py[cod]
+data/
+*.db
+*.db-wal
+*.db-shm
+tests/
+*.md

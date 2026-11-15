@@ -1,0 +1,37 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: followup-count-api:1.0.0
+    container_name: followup-count-api
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      # Single worker: SQLite serialises writers anyway, and one process keeps
+      # the in-process request handlers from multiplying lock contention.
+      DATABASE_PATH: /srv/data/followup.db
+      CSV_PATH: /srv/seed/followup.csv
+      TOTAL_BUDGET: "${TOTAL_BUDGET:-1}"
+      IMPORT_ON_STARTUP: "1"
+      SQLITE_BUSY_TIMEOUT_MS: "30000"
+    volumes:
+      # Named volume: the data set, the spent budget and every released answer
+      # persist across restarts and `docker compose up` recreations.
+      - followup-data:/srv/data
+      # Mount the CSV read-only; it is imported once, on first start only.
+      - ./seed:/srv/seed:ro
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  followup-data:
